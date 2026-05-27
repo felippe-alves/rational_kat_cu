@@ -1,24 +1,17 @@
-import glob
-from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CppExtension
+from setuptools import setup, find_packages
 
-
-sources = glob.glob('src/*.cpp')+glob.glob('src/*.cu')
-
+# NOTE: The original CUDA extension (ext_modules) is commented out because
+# kat-rational==0.4 never completed the build setup. The Triton-based
+# implementation in kat_rational/rational_triton.py is used instead —
+# it requires no compilation and ships with standard PyTorch.
 
 setup(
-    name='kat_rational',  # Name of the package
-    version='0.4',  # Version of the package
-    author='adamdad',  # Name of the author
-    author_email='yxy_adadm@qq.com',  # Contact email of the author
-    description='A simple example of a PyTorch extension, implementing a group-wise rational function for kat',  # Short description
-    long_description="""This package provides a PyTorch extension for computing group-wise rational functions. 
-                        It is designed to be used as part of the 'kat' project, enhancing its capabilities in handling
-                        specialized mathematical functions with optimized CUDA support.""",  # Detailed description
-    # ext_modules=[
-    #     CUDAExtension(name='kat_rational_cu', 
-    #                   sources=sources,
-    #                   )
-    # ],
-    cmdclass={'build_ext': BuildExtension}
+    name='kat_rational',
+    version='0.4',
+    author='adamdad',
+    author_email='yxy_adadm@qq.com',
+    description='Group-wise rational activation for KAT, with Triton kernels',
+    packages=['kat_rational', 'rational_kat_cu'],
+    # triton is not a standalone pip package on Linux — it ships bundled with PyTorch
+    install_requires=[],
 )
