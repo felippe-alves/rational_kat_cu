@@ -101,14 +101,17 @@ class _RationalGroupedFn(torch.autograd.Function):
         return d_x, d_a, d_b, None   # None for g (non-tensor arg)
 
 
-def rat_cuda(x, a, b):
-    """
-    Grouped Padé rational activation.
-
-    x : (N, D)   — 2-D input (batch×seq flattened)
-    a : (m+1,)   — shared numerator coefficients
-    b : (g, n)   — per-group denominator coefficients
-    """
+def _rat_cuda_impl(x, a, b):
     g = b.shape[0]
     a_grouped = a.unsqueeze(0).expand(g, -1).contiguous()
     return _RationalGroupedFn.apply(x, a_grouped, b, g)
+
+
+# Disable torch.compile tracing so AOT autograd never tries to fuse our
+# backward's PyTorch ops into a Triton reduction kernel (which crashes
+# Triton's pass manager on complex fused graphs).  The Triton forward
+# kernel still runs normally; the backward runs eagerly with no contention.
+try:
+    rat_cuda = torch.compiler.disable(_rat_cuda_impl)
+except AttributeError:
+    rat_cuda = torch._dynamo.disable(_rat_cuda_impl)
