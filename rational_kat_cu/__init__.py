@@ -1,17 +1,18 @@
 import torch
 from kat_rational.rational_triton import rational_fwd_triton
+from .rational_bwd_triton import rational_bwd_triton
 
 
 class _RationalGroupedFn(torch.autograd.Function):
     """
     Grouped Padé rational activation.
 
-    Forward: Triton kernel (fast, single fused launch per call).
-    Backward: pure PyTorch — avoids the tl.atomic_add contention in the
-    original Triton backward, where every thread hammered the same ~48
-    coefficient gradient slots (100M → 48 atomic collisions on rat2).
-    Here we recompute P/Q from saved x and reduce with .sum(), which
-    dispatches efficient parallel CUDA reductions with no contention.
+    Forward:  Triton kernel (single fused launch, rational_fwd_triton).
+    Backward: Triton kernel (rational_bwd_triton) with 2-D grid (g, blocks).
+              Each block belongs to exactly one group, so tl.sum() collapses
+              BLOCK contributions into a scalar before a single atomic_add per
+              coefficient — reducing atomic contention by a factor of BLOCK
+              compared to the element-wise approach in the original kernel.
 
     Polynomial convention (matches rational_triton.py):
         P(x) = a0 + a1*x + ... + a_m*x^m          (shared numerator)
@@ -32,71 +33,9 @@ class _RationalGroupedFn(torch.autograd.Function):
     @torch.cuda.amp.custom_bwd
     def backward(ctx, grad_output):
         x, a_grouped, b = ctx.saved_tensors
-        g   = ctx.g
-        N, D       = x.shape
-        m_plus_1   = a_grouped.shape[1]   # e.g. 6
-        n_coeff    = b.shape[1]           # e.g. 4
-        D_per_group = D // g
+        g = ctx.g
 
-        xg   = x.reshape(N, g, D_per_group)            # (N, g, Dg)
-        grad = grad_output.reshape(N, g, D_per_group)   # (N, g, Dg)
-        absx = xg.abs()
-
-        b_abs = b.abs()   # (g, n)
-
-        # Recompute Q via Horner on |x|
-        Q = b_abs[:, -1].view(1, g, 1).expand(N, g, D_per_group)
-        for i in range(n_coeff - 2, -1, -1):
-            Q = Q * absx + b_abs[:, i].view(1, g, 1)
-        Q = Q * absx + 1.0   # (N, g, Dg)
-
-        # Recompute P via Horner on x
-        P = a_grouped[:, -1].view(1, g, 1).expand(N, g, D_per_group)
-        for i in range(m_plus_1 - 2, -1, -1):
-            P = P * xg + a_grouped[:, i].view(1, g, 1)
-        # P: (N, g, Dg)
-
-        # dP/dx via Horner on derivative: a1 + x*(2a2 + x*(3a3 + ... + x*m*a_m))
-        dP = (m_plus_1 - 1) * a_grouped[:, -1].view(1, g, 1).expand(N, g, D_per_group)
-        for i in range(m_plus_1 - 2, 0, -1):
-            dP = dP * xg + i * a_grouped[:, i].view(1, g, 1)
-        # dP: (N, g, Dg)  — dP/dx of the numerator polynomial
-
-        # dQ/d|x| = |b0| + 2|b1||x| + 3|b2||x|^2 + ...
-        dQ_dabsx = b_abs[:, 0].view(1, g, 1).expand(N, g, D_per_group)
-        absx_pow = absx
-        for j in range(1, n_coeff):
-            dQ_dabsx = dQ_dabsx + (j + 1) * b_abs[:, j].view(1, g, 1) * absx_pow
-            absx_pow = absx_pow * absx
-        dQ = xg.sign() * dQ_dabsx   # dQ/dx = sign(x) * dQ/d|x|
-
-        Q2 = Q * Q
-
-        # Gradient w.r.t. x: (dP/dx * Q - P * dQ/dx) / Q^2 * grad
-        d_x = (dP / Q - P * dQ / Q2) * grad
-        d_x = d_x.reshape(N, D)
-
-        # Gradient w.r.t. a_grouped (shared numerator): sum over all groups and positions
-        # d_a_grouped[g, i] = sum_{N, Dg} ( x^i / Q * grad )
-        # PyTorch propagates this back through expand(g,-1) by summing over g dim,
-        # giving the correct gradient for the original (m+1,) shaped a parameter.
-        inv_Q_grad = grad / Q    # (N, g, Dg)
-        d_a = a_grouped.new_zeros(g, m_plus_1)
-        xpow = xg.new_ones(N, g, D_per_group)
-        for i in range(m_plus_1):
-            d_a[:, i] = (xpow * inv_Q_grad).sum(dim=(0, 2))
-            if i < m_plus_1 - 1:
-                xpow = xpow * xg
-
-        # Gradient w.r.t. b (per-group denominator)
-        # d_b[g, j] = sum_{N, Dg} ( -P/Q^2 * sign(b[g,j]) * |x|^(j+1) * grad )
-        mpq2_grad = (-P / Q2) * grad    # (N, g, Dg)
-        sign_b    = b.sign()            # (g, n)
-        d_b       = b.new_zeros(g, n_coeff)
-        absx_pow  = absx                # |x|^1
-        for j in range(n_coeff):
-            d_b[:, j] = (mpq2_grad * sign_b[:, j].view(1, g, 1) * absx_pow).sum(dim=(0, 2))
-            absx_pow = absx_pow * absx
+        d_x, d_a, d_b = rational_bwd_triton(x, a_grouped, b, grad_output, g)
 
         return d_x, d_a, d_b, None   # None for g (non-tensor arg)
 
@@ -107,10 +46,10 @@ def _rat_cuda_impl(x, a, b):
     return _RationalGroupedFn.apply(x, a_grouped, b, g)
 
 
-# Disable torch.compile tracing so AOT autograd never tries to fuse our
-# backward's PyTorch ops into a Triton reduction kernel (which crashes
-# Triton's pass manager on complex fused graphs).  The Triton forward
-# kernel still runs normally; the backward runs eagerly with no contention.
+# Disable torch.compile tracing so AOT autograd never tries to trace through
+# our custom Triton kernels.  Both forward and backward run as opaque CUDA
+# launches; torch.compile would otherwise try to re-compile the JIT-compiled
+# Triton IR and may crash the pass manager on complex fused graphs.
 try:
     rat_cuda = torch.compiler.disable(_rat_cuda_impl)
 except AttributeError:
