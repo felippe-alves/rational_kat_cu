@@ -11,12 +11,11 @@ Grid is 2-D: (g, ceil(N*Dg / BLOCK))
     as scalars and each block only ever touches one group's coefficient slots.
   - axis-1 (pid_b) tiles over the N*Dg elements that belong to that group.
 
-Because every block in a given axis-0 row shares the same coefficient slots,
-the atomic contention for d_a / d_b is reduced from
-  (N*D / BLOCK) threads per slot  →  ceil(N*Dg / BLOCK) per slot,
-a factor-of-g reduction.  More importantly, the per-block tl.sum() collapses
-BLOCK contributions into a single scalar before any atomic, so the actual
-atomic rate is ceil(N*Dg / BLOCK) — typically O(10^2) rather than O(10^5).
+Small tensors use a single-kernel atomic fallback: each block emits one summed
+contribution per coefficient. Large tensors use a two-pass path that writes
+per-block coefficient partials, then reduces those partials in separate kernels.
+That avoids thousands of blocks atomically contending on the same 10 coefficient
+slots per group while keeping dx fused with the main backward computation.
 """
 
 import torch
@@ -136,19 +135,20 @@ def _rational_bwd_kernel(
     sign_x = tl.where(x < 0.0, -1.0, 1.0)
     dQ = sign_x * dQ_dabsx
 
-    Q2 = Q * Q
+    inv_Q = 1.0 / Q
+    inv_Q2 = inv_Q * inv_Q
 
     # -----------------------------------------------------------------------
     # d_x (elementwise, stored directly)
     # -----------------------------------------------------------------------
-    dx = (dP / Q - P * dQ / Q2) * grad
+    dx = (dP * inv_Q - P * dQ * inv_Q2) * grad
     tl.store(dx_ptr + x_offs, dx, mask=mask)
 
     # -----------------------------------------------------------------------
     # d_a: one atomic_add per coefficient per block
     # contrib = sum_block( x^k / Q * grad )
     # -----------------------------------------------------------------------
-    inv_Q_grad = grad / Q
+    inv_Q_grad = grad * inv_Q
 
     # x powers
     xp1 = x
@@ -157,20 +157,18 @@ def _rational_bwd_kernel(
     xp4 = xp3 * x
     xp5 = xp4 * x
 
-    ones = tl.full([BLOCK], 1.0, dtype=tl.float32)
-
-    tl.atomic_add(da_ptr + a_base + 0, tl.sum(ones  * inv_Q_grad * mask, axis=0))
-    tl.atomic_add(da_ptr + a_base + 1, tl.sum(xp1   * inv_Q_grad * mask, axis=0))
-    tl.atomic_add(da_ptr + a_base + 2, tl.sum(xp2   * inv_Q_grad * mask, axis=0))
-    tl.atomic_add(da_ptr + a_base + 3, tl.sum(xp3   * inv_Q_grad * mask, axis=0))
-    tl.atomic_add(da_ptr + a_base + 4, tl.sum(xp4   * inv_Q_grad * mask, axis=0))
-    tl.atomic_add(da_ptr + a_base + 5, tl.sum(xp5   * inv_Q_grad * mask, axis=0))
+    tl.atomic_add(da_ptr + a_base + 0, tl.sum(inv_Q_grad, axis=0))
+    tl.atomic_add(da_ptr + a_base + 1, tl.sum(xp1 * inv_Q_grad, axis=0))
+    tl.atomic_add(da_ptr + a_base + 2, tl.sum(xp2 * inv_Q_grad, axis=0))
+    tl.atomic_add(da_ptr + a_base + 3, tl.sum(xp3 * inv_Q_grad, axis=0))
+    tl.atomic_add(da_ptr + a_base + 4, tl.sum(xp4 * inv_Q_grad, axis=0))
+    tl.atomic_add(da_ptr + a_base + 5, tl.sum(xp5 * inv_Q_grad, axis=0))
 
     # -----------------------------------------------------------------------
     # d_b: one atomic_add per coefficient per block
     # contrib = sum_block( -P/Q^2 * sign(b[j]) * |x|^(j+1) * grad )
     # -----------------------------------------------------------------------
-    mpq2_grad = (-P / Q2) * grad
+    mpq2_grad = (-P * inv_Q2) * grad
 
     sign_b0 = tl.where(b0 < 0.0, -1.0, 1.0)
     sign_b1 = tl.where(b1 < 0.0, -1.0, 1.0)
@@ -182,10 +180,168 @@ def _rational_bwd_kernel(
     axp3 = axp2 * abs_x
     axp4 = axp3 * abs_x
 
-    tl.atomic_add(db_ptr + b_base + 0, tl.sum(sign_b0 * axp1 * mpq2_grad * mask, axis=0))
-    tl.atomic_add(db_ptr + b_base + 1, tl.sum(sign_b1 * axp2 * mpq2_grad * mask, axis=0))
-    tl.atomic_add(db_ptr + b_base + 2, tl.sum(sign_b2 * axp3 * mpq2_grad * mask, axis=0))
-    tl.atomic_add(db_ptr + b_base + 3, tl.sum(sign_b3 * axp4 * mpq2_grad * mask, axis=0))
+    tl.atomic_add(db_ptr + b_base + 0, tl.sum(sign_b0 * axp1 * mpq2_grad, axis=0))
+    tl.atomic_add(db_ptr + b_base + 1, tl.sum(sign_b1 * axp2 * mpq2_grad, axis=0))
+    tl.atomic_add(db_ptr + b_base + 2, tl.sum(sign_b2 * axp3 * mpq2_grad, axis=0))
+    tl.atomic_add(db_ptr + b_base + 3, tl.sum(sign_b3 * axp4 * mpq2_grad, axis=0))
+
+
+@triton.jit
+def _rational_bwd_partial_kernel(
+    x_ptr, a_ptr, b_ptr, grad_ptr,
+    dx_ptr, partial_ptr,
+    N, D, Dg, BLOCKS_PER_GROUP,
+    M1: tl.constexpr,
+    NC: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TOTAL_COEFF: tl.constexpr,
+):
+    """Backward elementwise work plus per-block coefficient partials.
+
+    This large-tensor path avoids thousands of blocks atomically contending on
+    the same coefficient addresses. It writes one compact partial row per
+    (group, block), then a second kernel reduces those rows.
+    """
+    pid_g = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    offs = pid_b * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N * Dg
+
+    n_idx = offs // Dg
+    dg_idx = offs % Dg
+    x_offs = n_idx * D + pid_g * Dg + dg_idx
+
+    x = tl.load(x_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
+    grad = tl.load(grad_ptr + x_offs, mask=mask, other=0.0).to(tl.float32)
+
+    a_base = pid_g * M1
+    b_base = pid_g * NC
+
+    a0 = tl.load(a_ptr + a_base + 0).to(tl.float32)
+    a1 = tl.load(a_ptr + a_base + 1).to(tl.float32)
+    a2 = tl.load(a_ptr + a_base + 2).to(tl.float32)
+    a3 = tl.load(a_ptr + a_base + 3).to(tl.float32)
+    a4 = tl.load(a_ptr + a_base + 4).to(tl.float32)
+    a5 = tl.load(a_ptr + a_base + 5).to(tl.float32)
+
+    b0 = tl.load(b_ptr + b_base + 0).to(tl.float32)
+    b1 = tl.load(b_ptr + b_base + 1).to(tl.float32)
+    b2 = tl.load(b_ptr + b_base + 2).to(tl.float32)
+    b3 = tl.load(b_ptr + b_base + 3).to(tl.float32)
+
+    b0_abs = tl.abs(b0)
+    b1_abs = tl.abs(b1)
+    b2_abs = tl.abs(b2)
+    b3_abs = tl.abs(b3)
+    abs_x = tl.abs(x)
+
+    P = a5
+    P = tl.fma(P, x, a4)
+    P = tl.fma(P, x, a3)
+    P = tl.fma(P, x, a2)
+    P = tl.fma(P, x, a1)
+    P = tl.fma(P, x, a0)
+
+    Q = b3_abs
+    Q = tl.fma(Q, abs_x, b2_abs)
+    Q = tl.fma(Q, abs_x, b1_abs)
+    Q = tl.fma(Q, abs_x, b0_abs)
+    Q = tl.fma(Q, abs_x, 1.0)
+
+    dP = 5.0 * a5
+    dP = tl.fma(dP, x, 4.0 * a4)
+    dP = tl.fma(dP, x, 3.0 * a3)
+    dP = tl.fma(dP, x, 2.0 * a2)
+    dP = tl.fma(dP, x, a1)
+
+    dQ_dabsx = 4.0 * b3_abs
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, 3.0 * b2_abs)
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, 2.0 * b1_abs)
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, b0_abs)
+
+    sign_x = tl.where(x < 0.0, -1.0, 1.0)
+    dQ = sign_x * dQ_dabsx
+
+    inv_Q = 1.0 / Q
+    inv_Q2 = inv_Q * inv_Q
+
+    dx = (dP * inv_Q - P * dQ * inv_Q2) * grad
+    tl.store(dx_ptr + x_offs, dx, mask=mask)
+
+    xp1 = x
+    xp2 = xp1 * x
+    xp3 = xp2 * x
+    xp4 = xp3 * x
+    xp5 = xp4 * x
+
+    inv_Q_grad = grad * inv_Q
+
+    axp1 = abs_x
+    axp2 = axp1 * abs_x
+    axp3 = axp2 * abs_x
+    axp4 = axp3 * abs_x
+
+    sign_b0 = tl.where(b0 < 0.0, -1.0, 1.0)
+    sign_b1 = tl.where(b1 < 0.0, -1.0, 1.0)
+    sign_b2 = tl.where(b2 < 0.0, -1.0, 1.0)
+    sign_b3 = tl.where(b3 < 0.0, -1.0, 1.0)
+    mpq2_grad = (-P * inv_Q2) * grad
+
+    partial_base = (pid_g * BLOCKS_PER_GROUP + pid_b) * TOTAL_COEFF
+    tl.store(partial_ptr + partial_base + 0, tl.sum(inv_Q_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 1, tl.sum(xp1 * inv_Q_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 2, tl.sum(xp2 * inv_Q_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 3, tl.sum(xp3 * inv_Q_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 4, tl.sum(xp4 * inv_Q_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 5, tl.sum(xp5 * inv_Q_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 6, tl.sum(sign_b0 * axp1 * mpq2_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 7, tl.sum(sign_b1 * axp2 * mpq2_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 8, tl.sum(sign_b2 * axp3 * mpq2_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 9, tl.sum(sign_b3 * axp4 * mpq2_grad, axis=0))
+
+
+@triton.jit
+def _rational_num_reduce_kernel(
+    partial_ptr, da_ptr,
+    BLOCKS_PER_GROUP,
+    M1: tl.constexpr,
+    TOTAL_COEFF: tl.constexpr,
+    REDUCE_BLOCK: tl.constexpr,
+):
+    pid_g = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    offs = tl.arange(0, REDUCE_BLOCK)
+    mask = offs < BLOCKS_PER_GROUP
+    vals = tl.load(
+        partial_ptr + (pid_g * BLOCKS_PER_GROUP + offs) * TOTAL_COEFF + pid_c,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(da_ptr + pid_g * M1 + pid_c, tl.sum(vals, axis=0))
+
+
+@triton.jit
+def _rational_den_reduce_kernel(
+    partial_ptr, db_ptr,
+    BLOCKS_PER_GROUP,
+    M1: tl.constexpr,
+    NC: tl.constexpr,
+    TOTAL_COEFF: tl.constexpr,
+    REDUCE_BLOCK: tl.constexpr,
+):
+    pid_g = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    offs = tl.arange(0, REDUCE_BLOCK)
+    mask = offs < BLOCKS_PER_GROUP
+    vals = tl.load(
+        partial_ptr + (pid_g * BLOCKS_PER_GROUP + offs) * TOTAL_COEFF + M1 + pid_c,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(db_ptr + pid_g * NC + pid_c, tl.sum(vals, axis=0))
 
 
 # ---------------------------------------------------------------------------
@@ -214,18 +370,47 @@ def rational_bwd_triton(x, a_grouped, b, grad_output, g):
     Dg   = D // g
 
     dx = torch.empty_like(x)
-    da = torch.zeros_like(a_grouped)   # zeroed — kernel uses atomic_add
-    db = torch.zeros_like(b)
 
     BLOCK = 1024
-    grid  = (g, triton.cdiv(N * Dg, BLOCK))
+    blocks_per_group = triton.cdiv(N * Dg, BLOCK)
 
-    _rational_bwd_kernel[grid](
-        x, a_grouped, b, grad_output,
-        dx, da, db,
-        N, D, Dg,
-        M1=M1, NC=NC, BLOCK=BLOCK,
-    )
+    # For small tensors, one kernel with per-block atomics is faster and avoids
+    # a temporary allocation. For LLM activations, the two-pass path avoids heavy
+    # contention on the same 10 coefficient slots per group.
+    use_two_pass = 128 <= blocks_per_group <= 65536 and M1 == 6 and NC == 4
+    if use_two_pass:
+        da = torch.empty_like(a_grouped)
+        db = torch.empty_like(b)
+        total_coeff = M1 + NC
+        partial = torch.empty((g, blocks_per_group, total_coeff), device=x.device, dtype=torch.float32)
+        grid = (g, blocks_per_group)
+        _rational_bwd_partial_kernel[grid](
+            x, a_grouped, b, grad_output,
+            dx, partial,
+            N, D, Dg, blocks_per_group,
+            M1=M1, NC=NC, BLOCK=BLOCK, TOTAL_COEFF=total_coeff,
+        )
+        reduce_block = 1 << (blocks_per_group - 1).bit_length()
+        _rational_num_reduce_kernel[(g, M1)](
+            partial, da,
+            blocks_per_group,
+            M1=M1, TOTAL_COEFF=total_coeff, REDUCE_BLOCK=reduce_block,
+        )
+        _rational_den_reduce_kernel[(g, NC)](
+            partial, db,
+            blocks_per_group,
+            M1=M1, NC=NC, TOTAL_COEFF=total_coeff, REDUCE_BLOCK=reduce_block,
+        )
+    else:
+        da = torch.zeros_like(a_grouped)
+        db = torch.zeros_like(b)
+        grid = (g, blocks_per_group)
+        _rational_bwd_kernel[grid](
+            x, a_grouped, b, grad_output,
+            dx, da, db,
+            N, D, Dg,
+            M1=M1, NC=NC, BLOCK=BLOCK,
+        )
     return dx, da, db
 
 
