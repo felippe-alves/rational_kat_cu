@@ -78,6 +78,9 @@ def rational_fwd_triton(x, n, d, group):
     x_size = x.numel()
     D_per_group = D // group
 
+    assert n.numel() == group * 6, f"numerator: expected {group*6} coeffs, got {n.numel()}"
+    assert d.numel() == group * 4, f"denominator: expected {group*4} coeffs, got {d.numel()}"
+
     result = torch.empty_like(x)
     BLOCK_SIZE = 256
     num_blocks = (x_size + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -237,7 +240,7 @@ def rational_bwd_triton(grad_output, x, n, d, group):
 
 class RationalTriton1DGroup(torch.autograd.Function):
     @staticmethod
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def forward(ctx: torch.autograd.Function, 
                 input: Tensor, 
                 weight_numerator: Tensor, 
@@ -265,7 +268,7 @@ class RationalTriton1DGroup(torch.autograd.Function):
         return output
 
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx: torch.autograd.Function, grad_output: Tensor):
         """
         Backward pass of the rational function computed with Triton kernels.

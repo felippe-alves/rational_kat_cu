@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: kat_rational
+Version: 0.4
+Summary: Group-wise rational activation for KAT, with Triton kernels
+Author: adamdad
+Author-email: yxy_adadm@qq.com
+Dynamic: author
+Dynamic: author-email
+Dynamic: summary

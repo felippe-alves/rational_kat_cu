@@ -22,7 +22,7 @@ class _RationalGroupedFn(torch.autograd.Function):
     """
 
     @staticmethod
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @torch.amp.custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def forward(ctx, x, a_grouped, b, g):
         # x: (N, D)  a_grouped: (g, m+1)  b: (g, n)
         result = rational_fwd_triton(x, a_grouped.reshape(-1), b.reshape(-1), g)
@@ -31,7 +31,7 @@ class _RationalGroupedFn(torch.autograd.Function):
         return result
 
     @staticmethod
-    @torch.cuda.amp.custom_bwd
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
         x, a_grouped, b = ctx.saved_tensors
         g = ctx.g
@@ -46,12 +46,6 @@ def _rat_cuda_impl(x, a, b):
     a_grouped = a.unsqueeze(0).expand(g, -1).contiguous()
     return _RationalGroupedFn.apply(x, a_grouped, b, g)
 
-
 # Disable torch.compile tracing so AOT autograd never tries to trace through
-# our custom Triton kernels.  Both forward and backward run as opaque CUDA
-# launches; torch.compile would otherwise try to re-compile the JIT-compiled
-# Triton IR and may crash the pass manager on complex fused graphs.
-try:
-    rat_cuda = torch.compiler.disable(_rat_cuda_impl)
-except AttributeError:
-    rat_cuda = torch._dynamo.disable(_rat_cuda_impl)
+# our custom Triton kernels.
+rat_cuda = torch.compiler.disable(_rat_cuda_impl)
