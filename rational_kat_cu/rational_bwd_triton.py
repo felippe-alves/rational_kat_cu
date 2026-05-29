@@ -46,7 +46,7 @@ def _rational_bwd_kernel(
     Gradients:
       dx[i]    = (dP/dx * Q - P * dQ/dx) / Q^2 * grad_out[i]
       d_a[g,k] += sum_block( x^k / Q * grad_out )
-      d_b[g,j] += sum_block( -P/Q^2 * sign(D) * x^(j+1) * grad_out )
+      d_b[g,j] += sum_block( -P/Q^2 * sign(b[g,j]) * |x|^(j+1) * grad_out )
     """
     pid_g = tl.program_id(0)   # group index
     pid_b = tl.program_id(1)   # block index within this group
@@ -88,15 +88,12 @@ def _rational_bwd_kernel(
     b2 = tl.load(b_ptr + b_base + 2).to(tl.float32)
     b3 = tl.load(b_ptr + b_base + 3).to(tl.float32)
 
+    b0_abs = tl.abs(b0)
+    b1_abs = tl.abs(b1)
+    b2_abs = tl.abs(b2)
+    b3_abs = tl.abs(b3)
 
-    # Compute D(x) = b0*x + b1*x^2 + b2*x^3 + b3*x^4 via Horner
-    D = b3
-    D = tl.fma(D, x, b2)
-    D = tl.fma(D, x, b1)
-    D = tl.fma(D, x, b0)
-    D = D * x
-    # Q = 1 + |D|
-    Q = 1.0 + tl.abs(D)
+    abs_x = tl.abs(x)
 
     # -----------------------------------------------------------------------
     # Compute P(x) via Horner: a5*x^5 + ... + a0
@@ -109,6 +106,15 @@ def _rational_bwd_kernel(
     P = tl.fma(P, x, a0)
 
     # -----------------------------------------------------------------------
+    # Compute Q(|x|) via Horner: 1 + |b0|*|x| + ... + |b3|*|x|^4
+    # -----------------------------------------------------------------------
+    Q = b3_abs
+    Q = tl.fma(Q, abs_x, b2_abs)
+    Q = tl.fma(Q, abs_x, b1_abs)
+    Q = tl.fma(Q, abs_x, b0_abs)
+    Q = tl.fma(Q, abs_x, 1.0)
+
+    # -----------------------------------------------------------------------
     # Compute dP/dx via Horner: 5*a5*x^4 + 4*a4*x^3 + ... + a1
     # -----------------------------------------------------------------------
     dP = 5.0 * a5
@@ -117,13 +123,17 @@ def _rational_bwd_kernel(
     dP = tl.fma(dP, x, 2.0 * a2)
     dP = tl.fma(dP, x, a1)
 
-    # dD/dx = b0 + 2*b1*x + 3*b2*x^2 + 4*b3*x^3 via Horner
-    dD = 4.0 * b3
-    dD = tl.fma(dD, x, 3.0 * b2)
-    dD = tl.fma(dD, x, 2.0 * b1)
-    dD = tl.fma(dD, x, b0)
-    sign_D = tl.where(D < 0.0, -1.0, 1.0)
-    dQ = sign_D * dD
+    # -----------------------------------------------------------------------
+    # Compute dQ/dx = sign(x) * dQ/d|x|
+    # dQ/d|x| = |b0| + 2*|b1|*|x| + 3*|b2|*|x|^2 + 4*|b3|*|x|^3
+    # -----------------------------------------------------------------------
+    dQ_dabsx = 4.0 * b3_abs
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, 3.0 * b2_abs)
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, 2.0 * b1_abs)
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, b0_abs)
+
+    sign_x = tl.where(x < 0.0, -1.0, 1.0)
+    dQ = sign_x * dQ_dabsx
 
     inv_Q = 1.0 / Q
     inv_Q2 = inv_Q * inv_Q
@@ -154,15 +164,26 @@ def _rational_bwd_kernel(
     tl.atomic_add(da_ptr + a_base + 4, tl.sum(xp4 * inv_Q_grad, axis=0))
     tl.atomic_add(da_ptr + a_base + 5, tl.sum(xp5 * inv_Q_grad, axis=0))
 
+    # -----------------------------------------------------------------------
     # d_b: one atomic_add per coefficient per block
-    # contrib = sum_block( -P/Q^2 * sign(D) * x^(j+1) * grad )
+    # contrib = sum_block( -P/Q^2 * sign(b[j]) * |x|^(j+1) * grad )
+    # -----------------------------------------------------------------------
     mpq2_grad = (-P * inv_Q2) * grad
-    mpq2_grad_sD = mpq2_grad * sign_D
 
-    tl.atomic_add(db_ptr + b_base + 0, tl.sum(xp1 * mpq2_grad_sD, axis=0))
-    tl.atomic_add(db_ptr + b_base + 1, tl.sum(xp2 * mpq2_grad_sD, axis=0))
-    tl.atomic_add(db_ptr + b_base + 2, tl.sum(xp3 * mpq2_grad_sD, axis=0))
-    tl.atomic_add(db_ptr + b_base + 3, tl.sum(xp4 * mpq2_grad_sD, axis=0))
+    sign_b0 = tl.where(b0 < 0.0, -1.0, 1.0)
+    sign_b1 = tl.where(b1 < 0.0, -1.0, 1.0)
+    sign_b2 = tl.where(b2 < 0.0, -1.0, 1.0)
+    sign_b3 = tl.where(b3 < 0.0, -1.0, 1.0)
+
+    axp1 = abs_x
+    axp2 = axp1 * abs_x
+    axp3 = axp2 * abs_x
+    axp4 = axp3 * abs_x
+
+    tl.atomic_add(db_ptr + b_base + 0, tl.sum(sign_b0 * axp1 * mpq2_grad, axis=0))
+    tl.atomic_add(db_ptr + b_base + 1, tl.sum(sign_b1 * axp2 * mpq2_grad, axis=0))
+    tl.atomic_add(db_ptr + b_base + 2, tl.sum(sign_b2 * axp3 * mpq2_grad, axis=0))
+    tl.atomic_add(db_ptr + b_base + 3, tl.sum(sign_b3 * axp4 * mpq2_grad, axis=0))
 
 
 @triton.jit
@@ -209,12 +230,11 @@ def _rational_bwd_partial_kernel(
     b2 = tl.load(b_ptr + b_base + 2).to(tl.float32)
     b3 = tl.load(b_ptr + b_base + 3).to(tl.float32)
 
-    # D(x) = b0*x + b1*x^2 + b2*x^3 + b3*x^4 via Horner
-    D = b3
-    D = tl.fma(D, x, b2)
-    D = tl.fma(D, x, b1)
-    D = tl.fma(D, x, b0)
-    D = D * x
+    b0_abs = tl.abs(b0)
+    b1_abs = tl.abs(b1)
+    b2_abs = tl.abs(b2)
+    b3_abs = tl.abs(b3)
+    abs_x = tl.abs(x)
 
     P = a5
     P = tl.fma(P, x, a4)
@@ -223,7 +243,11 @@ def _rational_bwd_partial_kernel(
     P = tl.fma(P, x, a1)
     P = tl.fma(P, x, a0)
 
-    Q = 1.0 + tl.abs(D)
+    Q = b3_abs
+    Q = tl.fma(Q, abs_x, b2_abs)
+    Q = tl.fma(Q, abs_x, b1_abs)
+    Q = tl.fma(Q, abs_x, b0_abs)
+    Q = tl.fma(Q, abs_x, 1.0)
 
     dP = 5.0 * a5
     dP = tl.fma(dP, x, 4.0 * a4)
@@ -231,12 +255,13 @@ def _rational_bwd_partial_kernel(
     dP = tl.fma(dP, x, 2.0 * a2)
     dP = tl.fma(dP, x, a1)
 
-    dD = 4.0 * b3
-    dD = tl.fma(dD, x, 3.0 * b2)
-    dD = tl.fma(dD, x, 2.0 * b1)
-    dD = tl.fma(dD, x, b0)
-    sign_D = tl.where(D < 0.0, -1.0, 1.0)
-    dQ = sign_D * dD
+    dQ_dabsx = 4.0 * b3_abs
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, 3.0 * b2_abs)
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, 2.0 * b1_abs)
+    dQ_dabsx = tl.fma(dQ_dabsx, abs_x, b0_abs)
+
+    sign_x = tl.where(x < 0.0, -1.0, 1.0)
+    dQ = sign_x * dQ_dabsx
 
     inv_Q = 1.0 / Q
     inv_Q2 = inv_Q * inv_Q
@@ -252,8 +277,16 @@ def _rational_bwd_partial_kernel(
 
     inv_Q_grad = grad * inv_Q
 
+    axp1 = abs_x
+    axp2 = axp1 * abs_x
+    axp3 = axp2 * abs_x
+    axp4 = axp3 * abs_x
+
+    sign_b0 = tl.where(b0 < 0.0, -1.0, 1.0)
+    sign_b1 = tl.where(b1 < 0.0, -1.0, 1.0)
+    sign_b2 = tl.where(b2 < 0.0, -1.0, 1.0)
+    sign_b3 = tl.where(b3 < 0.0, -1.0, 1.0)
     mpq2_grad = (-P * inv_Q2) * grad
-    mpq2_grad_sD = mpq2_grad * sign_D
 
     partial_base = (pid_g * BLOCKS_PER_GROUP + pid_b) * TOTAL_COEFF
     tl.store(partial_ptr + partial_base + 0, tl.sum(inv_Q_grad, axis=0))
@@ -262,10 +295,10 @@ def _rational_bwd_partial_kernel(
     tl.store(partial_ptr + partial_base + 3, tl.sum(xp3 * inv_Q_grad, axis=0))
     tl.store(partial_ptr + partial_base + 4, tl.sum(xp4 * inv_Q_grad, axis=0))
     tl.store(partial_ptr + partial_base + 5, tl.sum(xp5 * inv_Q_grad, axis=0))
-    tl.store(partial_ptr + partial_base + 6, tl.sum(xp1 * mpq2_grad_sD, axis=0))
-    tl.store(partial_ptr + partial_base + 7, tl.sum(xp2 * mpq2_grad_sD, axis=0))
-    tl.store(partial_ptr + partial_base + 8, tl.sum(xp3 * mpq2_grad_sD, axis=0))
-    tl.store(partial_ptr + partial_base + 9, tl.sum(xp4 * mpq2_grad_sD, axis=0))
+    tl.store(partial_ptr + partial_base + 6, tl.sum(sign_b0 * axp1 * mpq2_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 7, tl.sum(sign_b1 * axp2 * mpq2_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 8, tl.sum(sign_b2 * axp3 * mpq2_grad, axis=0))
+    tl.store(partial_ptr + partial_base + 9, tl.sum(sign_b3 * axp4 * mpq2_grad, axis=0))
 
 
 @triton.jit

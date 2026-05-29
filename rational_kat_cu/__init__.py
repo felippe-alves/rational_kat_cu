@@ -14,10 +14,9 @@ class _RationalGroupedFn(torch.autograd.Function):
               coefficient — reducing atomic contention by a factor of BLOCK
               compared to the element-wise approach in the original kernel.
 
-    Polynomial convention:
-        P(x) = a0 + a1*x + ... + a_m*x^m              (shared numerator)
-        D(x) = b0*x + b1*x^2 + ... + b_{n-1}*x^n      (per-group, raw coeffs)
-        Q(x) = 1 + |D(x)|                              (abs after sum)
+    Polynomial convention (matches rational_triton.py):
+        P(x) = a0 + a1*x + ... + a_m*x^m          (shared numerator)
+        Q(x) = 1 + |b0|*|x| + ... + |b_{n-1}|*|x|^n  (per-group denominator)
         out  = P / Q
     """
 
@@ -45,6 +44,7 @@ def _rat_cuda_impl(x, a, b):
     g = b.shape[0]
     a_grouped = a.unsqueeze(0).expand(g, -1).contiguous()
     return _RationalGroupedFn.apply(x, a_grouped, b, g)
+
 
 # Disable torch.compile tracing so AOT autograd never tries to trace through
 # our custom Triton kernels.

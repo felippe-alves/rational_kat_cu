@@ -11,7 +11,7 @@ __global__ void rational_fwd_cuda_kernel_1dgroup(
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx >= x_size) return;
+    if (idx >= x_size) return;  // Prevent out-of-bounds memory access
 
     // Calculate the index within the dimension D
     int d_index = idx % D;
@@ -22,32 +22,31 @@ __global__ void rational_fwd_cuda_kernel_1dgroup(
     int a_idx = g_index * 6;
     int b_idx = g_index * 4;
 
-    // Load coefficients into registers (raw — abs applied after sum)
+    // Load coefficients into registers
     scalar_t s_a[6], s_b[4];
     for (int i = 0; i < 6; ++i) {
         s_a[i] = a[a_idx + i];
     }
     for (int i = 0; i < 4; ++i) {
-        s_b[i] = b[b_idx + i];
+        s_b[i] = abs(b[b_idx + i]);  // Store absolute values directly if needed
     }
 
     // Obtain the input value from the tensor
     scalar_t xp1 = x[idx];
+    scalar_t abs_xp1 = abs(xp1);
 
-    // Compute P(x) via Horner's method
+    // Compute the polynomial for P using Horner's method
     scalar_t P = s_a[5];
     for (int i = 4; i >= 0; --i) {
         P = fmaf(P, xp1, s_a[i]);
     }
-
-    // Compute D(x) = b0*x + b1*x^2 + b2*x^3 + b3*x^4 via Horner
-    scalar_t D = s_b[3];
+    
+    // Compute the polynomial for Q using Horner's method
+    scalar_t Q = s_b[3];
     for (int i = 2; i >= 0; --i) {
-        D = fmaf(D, xp1, s_b[i]);
+        Q = fmaf(Q, abs_xp1, s_b[i]);
     }
-    D *= xp1;
-    // Q(x) = 1 + |D(x)|
-    scalar_t Q = 1.0f + fabsf(D);
+    Q = fmaf(Q, abs_xp1, 1.0);
 
     // Write the result of P / Q
     result[idx] = P / Q;
@@ -65,7 +64,7 @@ torch::Tensor rational_fwd_cuda_1dgroup(
     int L = x.size(1);
     int D = x.size(2);
 
-    int threads_per_block = 256;
+    int threads_per_block = 256;  // Adjust as needed based on device capabilities
     int num_blocks = (x_size + threads_per_block - 1) / threads_per_block;
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "rational_fwd_cuda_1dgroup", ([&] {
@@ -81,12 +80,13 @@ torch::Tensor rational_fwd_cuda_1dgroup(
     return result;
 }
 
-// D(X) = b_0*X + b_1*X^2 + b_2*X^3 + b_3*X^4
-// Q(X) = 1 + |D(X)|
-// dQ/dx = sign(D) * D'(X)  where D'(X) = b_0 + 2*b_1*X + 3*b_2*X^2 + 4*b_3*X^3
-// dF/dx = (-P/Q^2) * dQ/dx + dP/dx / Q
-// dF/da_i = x^i / Q, i \in {0,5}
-// dF/db_i = (-P/Q^2) * sign(D) * X^{i+1}, i \in {0,3}
+//P(X) = a_0 + a_1*X + a_2*X^2 ...
+//Q(X) = 1 + |b_0||X| + |b_1||X|^2 + |b_2||X|^3
+//R(X) = a_1 + 2*a_2*X + 3*a_3*X ...
+//S(X) = sign(X) * ( |b_0| + 2|b_1||X| + 3|b_2||X|^2 ...)
+//dF/dx = (-P(X)/Q(X)^2)*S(X) + R(X)/Q(X)
+//dF/da_i = x^i/Q(X), i \in {0,5}
+//dF/db_i = (-P(X)/Q(X)^2) * sign(b_i) * |X^{i+1}| , i \in {0,4}
 
 
 template <typename scalar_t>
@@ -122,7 +122,7 @@ __global__ void rational_bwd_cuda_kernel_1dgroup(
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx >= x_size) return;
+    if (idx >= x_size) return;  // Prevent out-of-bounds memory access
 
     // Calculate the index within the dimension D
     int d_index = idx % D;
@@ -133,19 +133,21 @@ __global__ void rational_bwd_cuda_kernel_1dgroup(
     int a_idx = g_index * 6;
     int b_idx = g_index * 4;
 
-    // Load coefficients into registers (raw — abs applied after sum)
-    scalar_t shared_a[6], shared_b[4];
+    // Load coefficients into registers
+    scalar_t shared_a[6], shared_b_abs[4], shared_b[4];;
     for (int i = 0; i < 6; ++i) {
         shared_a[i] = a[a_idx + i];
     }
     for (int i = 0; i < 4; ++i) {
+        shared_b_abs[i] = abs(b[b_idx + i]);  // Store absolute values directly if needed
         shared_b[i] = b[b_idx + i];
     }
 
-    scalar_t local_da[6] = {0};
+    scalar_t local_da[6] = {0}; // Local accumulation arrays
     scalar_t local_db[4] = {0};
     
     scalar_t xp = x[idx];
+    scalar_t axp = abs(xp);
     // Compute powers of xp
     scalar_t xp_powers[5];
     xp_powers[0] = xp;
@@ -154,6 +156,15 @@ __global__ void rational_bwd_cuda_kernel_1dgroup(
     xp_powers[3] = xp * xp_powers[2]; // xp^4
     xp_powers[4] = xp * xp_powers[3]; // xp^5
 
+    // Compute powers of axp
+    scalar_t axp_powers[4];
+    axp_powers[0] = axp;
+    axp_powers[1] = axp * axp_powers[0]; // axp^2
+    axp_powers[2] = axp * axp_powers[1]; // axp^3
+    axp_powers[3] = axp * axp_powers[2]; // axp^4
+
+    // Compute absolute values once
+
     scalar_t P = shared_a[0] 
     + shared_a[1] * xp_powers[0] 
     + shared_a[2] * xp_powers[1] 
@@ -161,45 +172,41 @@ __global__ void rational_bwd_cuda_kernel_1dgroup(
     + shared_a[4] * xp_powers[3] 
     + shared_a[5] * xp_powers[4];
 
-    // D(x) = b0*x + b1*x^2 + b2*x^3 + b3*x^4
-    scalar_t D = shared_b[0] * xp_powers[0]
-               + shared_b[1] * xp_powers[1]
-               + shared_b[2] * xp_powers[2]
-               + shared_b[3] * xp_powers[3];
-    // Q(x) = 1 + |D(x)|
-    scalar_t Q = scalar_t(1.0) + fabsf(D);
+    scalar_t Q = scalar_t(1.0)
+    + shared_b_abs[0] * axp_powers[0] 
+    + shared_b_abs[1] * axp_powers[1] 
+    + shared_b_abs[2] * axp_powers[2] 
+    + shared_b_abs[3] * axp_powers[3];
 
-    scalar_t dP = shared_a[1] 
+
+    scalar_t R = shared_a[1] 
     + scalar_t(2.0) * shared_a[2] * xp_powers[0] 
     + scalar_t(3.0) * shared_a[3] * xp_powers[1] 
     + scalar_t(4.0) * shared_a[4] * xp_powers[2] 
     + scalar_t(5.0) * shared_a[5] * xp_powers[3];
 
-    // D'(x) = b0 + 2*b1*x + 3*b2*x^2 + 4*b3*x^3
-    scalar_t dD = shared_b[0]
-    + scalar_t(2.0) * shared_b[1] * xp_powers[0]
-    + scalar_t(3.0) * shared_b[2] * xp_powers[1]
-    + scalar_t(4.0) * shared_b[3] * xp_powers[2];
-
-    scalar_t sign_D = copysign(scalar_t(1.0), D);
-    scalar_t dQ = sign_D * dD;
+    scalar_t S = copysign(scalar_t(1.0), xp) * (shared_b_abs[0] 
+    + scalar_t(2.0) * shared_b_abs[1] * axp_powers[0] 
+    + scalar_t(3.0) * shared_b_abs[2] * axp_powers[1] 
+    + scalar_t(4.0) * shared_b_abs[3] * axp_powers[2]);
+    
 
     scalar_t grad_o = grad_output[idx];
     
     scalar_t mpq2 = -P/(Q*Q);
 
-    scalar_t d_i_x = (dP / Q + dQ * mpq2) * grad_o;
+    scalar_t d_i_x = (R / Q + S * mpq2) * grad_o;
     d_x[idx] = d_i_x;
 
-    // d_a contributions
+    // Loop for computing d_a contributions
     local_da[0] = scalar_t(1.0) / Q * grad_o;
     for (int i = 1; i < 6; ++i) {
         local_da[i] = (xp_powers[i-1] / Q) * grad_o;
     }
 
-    // d_b contributions: -P/Q^2 * sign(D) * x^(i+1) * grad_o
+    // Loop for computing d_b contributions
     for (int i = 0; i < 4; ++i) {
-        local_db[i] = mpq2 * sign_D * xp_powers[i] * grad_o;
+        local_db[i] = mpq2 * copysign(scalar_t(1.0), shared_b[i]) * axp_powers[i] * grad_o;
     }
 
     // Reduce local arrays to shared memory
@@ -236,7 +243,7 @@ std::vector<torch::Tensor> rational_bwd_cuda_1dgroup(torch::Tensor grad_output, 
     int L = x.size(1);
     int D = x.size(2);
 
-    int blockSize = 256;
+    int blockSize = 256;  // You might want to experiment with this value
     int numBlocks = (x_size + blockSize - 1) / blockSize;
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "rational_bwd_cuda_1dgroup", ([&] {
