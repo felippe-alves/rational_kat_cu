@@ -3,12 +3,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-# --------------------
-# Forward kernel
-# --------------------
-# The forward kernel computes for each element:
-#   P = a0 + a1*x + a2*x^2 + a3*x^3 + a4*x^4 + a5*x^5   (computed by Horner’s method)
-#   Q = 1 + |b0|*|x| + |b1|*|x|^2 + |b2|*|x|^3 + |b3|*|x|^4
+#   D = b0*x + b1*x^2 + b2*x^3 + b3*x^4   (Horner's method, raw coeffs)
+#   Q = 1 + |D|                             (abs after sum)
 #   result = P / Q
 #
 # Each “group” uses 6 coefficients from a and 4 coefficients from b.
@@ -52,13 +48,11 @@ def rational_fwd_kernel(
     s_a4 = tl.load(a_ptr + a_offset + 4)
     s_a5 = tl.load(a_ptr + a_offset + 5)
 
-    # Load denominator coefficients (using absolute value).
-    s_b0 = tl.abs(tl.load(b_ptr + b_offset + 0))
-    s_b1 = tl.abs(tl.load(b_ptr + b_offset + 1))
-    s_b2 = tl.abs(tl.load(b_ptr + b_offset + 2))
-    s_b3 = tl.abs(tl.load(b_ptr + b_offset + 3))
-
-    abs_x = tl.abs(x_val)
+    # Load denominator coefficients (raw — abs applied after sum).
+    s_b0 = tl.load(b_ptr + b_offset + 0)
+    s_b1 = tl.load(b_ptr + b_offset + 1)
+    s_b2 = tl.load(b_ptr + b_offset + 2)
+    s_b3 = tl.load(b_ptr + b_offset + 3)
 
     # Compute numerator polynomial P(x) via Horner's method.
     P = s_a5
@@ -68,12 +62,14 @@ def rational_fwd_kernel(
     P = tl.fma(P, x_val, s_a1)
     P = tl.fma(P, x_val, s_a0)
 
-    # Compute denominator polynomial Q(x).
-    Q = s_b3
-    Q = tl.fma(Q, abs_x, s_b2)
-    Q = tl.fma(Q, abs_x, s_b1)
-    Q = tl.fma(Q, abs_x, s_b0)
-    Q = tl.fma(Q, abs_x, 1.0)
+    # Compute raw denominator polynomial D(x) = b0*x + b1*x^2 + b2*x^3 + b3*x^4 (Horner).
+    D = s_b3
+    D = tl.fma(D, x_val, s_b2)
+    D = tl.fma(D, x_val, s_b1)
+    D = tl.fma(D, x_val, s_b0)
+    D = D * x_val
+    # Q(x) = 1 + |D(x)|
+    Q = 1.0 + tl.abs(D)
 
     tl.store(result_ptr + offs, P / Q, mask=mask)
 
